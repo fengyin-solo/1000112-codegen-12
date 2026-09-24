@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.quality import QualityService
+from app.services.quality import CONCLUSIONS, QualityService, parse_time_value
 
 router = APIRouter(prefix="/api/quality", tags=["质检管理"])
 
@@ -20,14 +20,54 @@ STATUSES = ["待检测", "检测中", "合格", "不合格"]
 def list_entries(
     keyword: str | None = Query(default=None, description="按质检单号检索"),
     status: str | None = Query(default=None, description="待检测、检测中、合格、不合格"),
+    item_name: str | None = Query(default=None, description="按检测项目模糊检索"),
+    conclusion: str | None = Query(default=None, description="检测结论：合格、不合格、待复检"),
+    inspector: str | None = Query(default=None, description="按检测员模糊检索"),
+    begin_time: str | None = Query(default=None, description="检测时间起，YYYY-MM-DD[ HH:mm:ss]"),
+    end_time: str | None = Query(default=None, description="检测时间止，YYYY-MM-DD[ HH:mm:ss]"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按质检单号与状态过滤质检管理列表；没有数据时返回空页，不报错。"""
+    """多条件组合过滤质检单：所有非空条件同时生效，结果按检测时间倒序分页。
+
+    条件不合法时返回 400 并说明原因，由前端回退到上一次查询结果。
+    """
+    if page < 1:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+    if size < 1:
+        raise HTTPException(status_code=400, detail="每页条数至少为 1")
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    if status is not None and status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"检测状态只能是：{'、'.join(STATUSES)}")
+    if conclusion is not None and conclusion not in CONCLUSIONS:
+        raise HTTPException(status_code=400, detail=f"检测结论只能是：{'、'.join(CONCLUSIONS)}")
+    try:
+        begin = parse_time_value(begin_time, field_name="检测开始时间")
+        end = parse_time_value(end_time, field_name="检测结束时间")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if begin is not None and end is not None and begin > end:
+        raise HTTPException(status_code=400, detail="检测开始时间不能晚于结束时间")
+    items, total = service.list_entries(
+        keyword=(keyword.strip() if keyword and keyword.strip() else None),
+        status=status,
+        item_name=(item_name.strip() if item_name and item_name.strip() else None),
+        conclusion=conclusion,
+        inspector=(inspector.strip() if inspector and inspector.strip() else None),
+        begin_time=begin,
+        end_time=end,
+        page=page,
+        size=size,
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出质检管理清单：按检测时间倒序返回全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "quality", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +96,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出质检管理清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "quality", "total": total, "items": items}
